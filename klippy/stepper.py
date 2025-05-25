@@ -6,6 +6,8 @@
 import collections
 import math
 from . import chelper
+import odrive
+from odrive.enums import InputMode
 
 
 class error(Exception):
@@ -324,10 +326,158 @@ class MCU_stepper:
         return ffi_lib.itersolve_is_active_axis(self._stepper_kinematics, a)
 
 
-# Helper code to build a stepper object from a config section
+# Lightweight container for one trapezoid segment
+_TrapSeg = namedtuple('_TrapSeg',
+                      ['print_time', 'move_t', 'start_v', 'accel',
+                       'start_x', 'start_y', 'start_z',
+                       'x_r', 'y_r', 'z_r']
+                      )
+
+
+class ODriveStepper:
+    def __init__(self, name, axis, rotation_dist, steps_per_rotation, step_dist):
+        self._name = name
+        self.axis = axis
+        self._rotation_dist = rotation_dist
+        self._steps_per_rotation = steps_per_rotation
+        self._step_dist = step_dist
+        self._trapq = None
+
+    # Identity for M18/M84
+    def get_name(self, short=False):
+        if short and self._name.startswith('stepper_'):
+            return self._name[8:]
+        return self._name
+
+    # Kinematics wiring (no-ops)
+    def setup_itersolve(self, *args, **kwargs):
+        pass
+
+    def set_trapq(self, trapq):
+        self._trapq = trapq
+
+    def generate_steps(self, flush_time):
+        if self._trapq is None:
+            return
+
+        LEAD_TIME = 0.020  # 20 ms ahead
+        SAFETY = 0.001  # 1 ms safety
+        ffi, lib = chelper.get_ffi()
+
+        trapq_p = ffi.cast("struct trapq *", self._trapq)
+        if not hasattr(self, "_last_pull"):
+            self._last_pull = 0.0
+            self.reactor = self.axis._parent.get_printer().get_reactor()
+
+        horizon = flush_time + LEAD_TIME
+        node = trapq_p.moves.next
+
+        while node != ffi.addressof(trapq_p.moves):
+            m = ffi.cast("struct move *",
+                         ffi.cast("char *", node)
+                         - ffi.offsetof("struct move", "node"))
+
+            if m.print_time >= horizon:
+                break
+            if m.print_time + m.move_t <= self._last_pull:
+                node = node.next
+                continue
+
+            # Copy out the data we need into a Python object:
+            seg = _TrapSeg(
+                print_time=m.print_time,
+                move_t=m.move_t,
+                start_v=m.start_v,
+                accel=2.0 * m.half_accel,
+                start_x=m.start_pos.x,
+                start_y=m.start_pos.y,
+                start_z=m.start_pos.z,
+                x_r=m.axes_r.x,
+                y_r=m.axes_r.y,
+                z_r=m.axes_r.z
+            )
+
+            # Schedule dispatch exactly at seg.print_time - SAFETY
+            trigger = max(seg.print_time - SAFETY,
+                          self.reactor.monotonic())
+            self.reactor.register_timer(
+                lambda et, s=seg: self._dispatch_segment(s),
+                trigger
+            )
+
+            node = node.next
+
+        self._last_pull = horizon
+
+    def _dispatch_segment(self, seg):
+        """
+        Runs in the reactor at the segment's precise start time.
+        `seg` is a _TrapSeg tuple with all needed data.
+        """
+        # Compute scalar distance: d = v0*t + ½ a t²
+        d = (seg.start_v + 0.5 * seg.accel * seg.move_t) * seg.move_t
+
+        # End-point in Cartesian space
+        end_x = seg.start_x + seg.x_r * d
+        end_y = seg.start_y + seg.y_r * d
+        end_z = seg.start_z + seg.z_r * d
+
+        # Pick the right axis
+        if self._name.endswith('_x'):
+            coord = end_x
+        elif self._name.endswith('_y'):
+            coord = end_y
+        else:
+            coord = end_z
+
+        turns = coord / self._rotation_dist
+        self.axis.controller.input_pos = turns
+        self.axis.controller.input_mode = INPUT_MODE_TRAP_TRAJ
+
+        return self.reactor.NEVER
+
+    # force_move support
+    def get_step_dist(self):
+        return self._step_dist
+
+    def get_commanded_position(self):
+        # Directly use the encoder count as “steps since home”
+        raw = self.axis.encoder.pos_estimate * self._steps_per_rotation
+        return int(round(raw))
+
+    def set_position(self, coord):
+        """
+        Called by the homing code or G92/SET_POSITION.
+        coord[0] is the desired logical position (in mm).
+        We convert that to encoder counts and reset the drive.
+        """
+        # Target in “turns” for the drive’s timer
+        turns = coord[0] / self._rotation_dist
+        # Convert to raw counts
+        target_counts = int(round(turns * self._steps_per_rotation))
+
+        # Reset the drive’s linear count to that value
+        try:
+            self.axis.encoder.set_linear_count(target_counts)
+        except AttributeError:
+            # Older firmware: fallback to setting pos_estimate directly
+            self.axis.controller.input_pos = turns
+            self.axis.encoder.pos_estimate = turns
+
+    # motion_report support
+    def get_mcu_position(self, cmd_pos=None):
+        return self.get_commanded_position()
+
+
 def PrinterStepper(config, units_in_radians=False):
     printer = config.get_printer()
     name = config.get_name()
+
+    driver = config.get('driver', '').lower().strip()
+    if driver == 'odrive':
+        return _build_odrive_stepper(config, units_in_radians)
+
+    # Default: regular MCU_stepper path
     # Stepper definition
     ppins = printer.lookup_object("pins")
     step_pin = config.get("step_pin")
@@ -354,6 +504,38 @@ def PrinterStepper(config, units_in_radians=False):
         m = printer.load_object(config, mname)
         m.register_stepper(config, mcu_stepper)
     return mcu_stepper
+
+
+def _build_odrive_stepper(cfg, units_in_radians):
+    printer = cfg.get_printer()
+    name = cfg.get_name()  # e.g. "stepper_x"
+    serial = cfg.get('serial')
+    axis_id = cfg.getint('axis')
+
+    # Read your pulley-based rotation_distance from config
+    rotation_dist, _ = parse_step_distance(cfg, units_in_radians, True)
+
+    # Query the ODrive for its encoder CPR
+    odrv = odrive.find_any(serial_number=serial)
+    axis = odrv.axes[axis_id]
+    cpr = axis.encoder.config.cpr
+    if cpr <= 0:
+        raise error(f"ODriveStepper {name}: invalid encoder.config.cpr={cpr}")
+
+    # Compute step distance (mm per encoder count)
+    step_dist = rotation_dist / float(cpr)
+
+    # Configure trap limits on the drive
+    al = cfg.getfloat('accel_limit', 50000.0)
+    dl = cfg.getfloat('decel_limit', al)
+    axis.trap_traj.config.accel_limit = al
+    axis.trap_traj.config.decel_limit = dl
+
+    # Instantiate and register
+    stepper = ODriveStepper(name, axis, rotation_dist, cpr, step_dist)
+    for mname in ['stepper_enable', 'force_move', 'motion_report']:
+        printer.load_object(cfg, mname).register_stepper(cfg, stepper)
+    return stepper
 
 
 # Parse stepper gear_ratio config parameter
